@@ -15,11 +15,14 @@ using namespace std::chrono_literals;
 
 using mosquitto_version_t = std::tuple<int32_t, int32_t , int32_t>;
 
+enum class mosquitto_qos { qos_at_most_once = 0,
+                           qos_at_least_once = 1,
+                           qos_exactly_once = 2};
+
 class gnat {
 
  private:
   static constexpr std::chrono::seconds DEFAULT_MQTT_KEEPALIVE = 60s;
-  static bool MOSQUITTO_INITIALIZED;
 
   inline static void on_mosq_connect(mosquitto* m, void* object, int return_code) {
 
@@ -44,14 +47,38 @@ class gnat {
     return ec.default_error_condition();
   }
 
+  static std::error_condition convert_mosquitto_error(int mosquitto_error) {
+    switch (mosquitto_error) {
+      case MOSQ_ERR_SUCCESS:
+        return {};
+      case MOSQ_ERR_INVAL:
+        return std::errc::invalid_argument;
+      case MOSQ_ERR_NOMEM:
+        return std::errc::not_enough_memory;
+      case MOSQ_ERR_NO_CONN:
+        return std::errc::not_connected;
+      case MOSQ_ERR_MALFORMED_UTF8:
+        return std::errc::illegal_byte_sequence;
+      case MOSQ_ERR_OVERSIZE_PACKET:
+        return std::errc::value_too_large;
+      case MOSQ_ERR_ERRNO:
+        return get_last_error();
+      default:
+        return std::errc::protocol_error; //debatable
+    }
+  }
+
+  gnat() = default;
+
  protected:
   std::string _client_id;
   mosquitto* _mosquitto_obj{};
  public:
 
   explicit gnat(const std::string& client_id) {
-    if ((!MOSQUITTO_INITIALIZED) && (mosquitto_lib_init() == MOSQ_ERR_SUCCESS)) {
-      MOSQUITTO_INITIALIZED = true;
+    static bool mosquitto_initialized = false;
+    if ((!mosquitto_initialized) && (mosquitto_lib_init() == MOSQ_ERR_SUCCESS)) {
+      mosquitto_initialized = true;
     }
   }
 
@@ -78,13 +105,14 @@ class gnat {
     mosquitto_connect_callback_set(_mosquitto_obj, on_mosq_connect);
     mosquitto_disconnect_callback_set(_mosquitto_obj, on_mosq_disconnect);
     mosquitto_message_callback_set(_mosquitto_obj, on_mosq_message);
-    int result =  mosquitto_connect(_mosquitto_obj, host.c_str(), port, DEFAULT_MQTT_KEEPALIVE.count());
-    if (result == MOSQ_ERR_ERRNO) {
-      return get_last_error();
-    } else if (result == MOSQ_ERR_INVAL) {
-      return std::errc::invalid_argument;
-    }
-    return {};
+    return convert_mosquitto_error(mosquitto_connect(_mosquitto_obj,
+                                                     host.c_str(),
+                                                     port,
+                                                     DEFAULT_MQTT_KEEPALIVE.count()));
+  }
+
+  inline std::error_condition subscribe(const std::string& topic, mosquitto_qos qos) {
+    return convert_mosquitto_error(mosquitto_subscribe(_mosquitto_obj, nullptr, topic.c_str(), static_cast<int>(qos)));
   }
 
 };
