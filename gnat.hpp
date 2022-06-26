@@ -8,12 +8,16 @@
 #include <tuple>
 #include <string>
 #include <memory>
+#include <functional>
+#include <utility>
+#include <cstring>
 #include "mosquitto.h"
 namespace gnat {
 
 using namespace std::chrono_literals;
 
 using mosquitto_version_t = std::tuple<int32_t, int32_t , int32_t>;
+using gnat_callback_on_message_t = std::function<void(int32_t, const std::string&, std::vector<uint8_t>)>;
 
 enum class mosquitto_qos { qos_at_most_once = 0,
                            qos_at_least_once = 1,
@@ -25,15 +29,27 @@ class gnat {
   static constexpr std::chrono::seconds DEFAULT_MQTT_KEEPALIVE = 60s;
 
   inline static void on_mosq_connect(mosquitto* m, void* object, int return_code) {
-
+    ((gnat*)object)->_connected = true;
   };
 
   inline static void on_mosq_disconnect(mosquitto* m, void* object, int return_code) {
+    ((gnat*)object)->_connected = false;
+  };
+
+  inline static void on_mosq_message(mosquitto* m, void* object, const mosquitto_message* msg) {
+    if (((gnat*)object)->_on_message_callback) {
+      std::vector<uint8_t> data(msg->payloadlen);
+      std::memcpy(data.data(), msg->payload, msg->payloadlen);
+      ((gnat*)object)->_on_message_callback(msg->mid, msg->topic, data);
+    }
+  };
+
+  inline static void on_mosq_subscribe(mosquitto* m, void* userdata, int message_id, int count_granted_subs, const int* granted_qos){
 
   };
 
-  inline static void on_mosq_message(mosquitto* m, void* object, const mosquitto_message*) {
-
+  inline static void on_mosq_log_message(mosquitto* m, void* userdata, int log_level, const char* msg) {
+    //std::cout << "MOSQUITTO LOG: " << msg << std::endl;
   };
 
   static std::error_condition get_last_error()
@@ -71,19 +87,18 @@ class gnat {
   gnat() = default;
 
  protected:
+  std::atomic<bool> _connected = false;
   std::string _client_id;
   mosquitto* _mosquitto_obj{};
+  gnat_callback_on_message_t _on_message_callback;
  public:
 
   explicit gnat(const std::string& client_id) {
+    _client_id = client_id;
     static bool mosquitto_initialized = false;
     if ((!mosquitto_initialized) && (mosquitto_lib_init() == MOSQ_ERR_SUCCESS)) {
       mosquitto_initialized = true;
     }
-  }
-
-  inline bool is_valid() {
-    return _mosquitto_obj;
   }
 
   inline static mosquitto_version_t get_mosquitto_version() {
@@ -92,28 +107,85 @@ class gnat {
     return mosquitto_version_t{major, minor, patch};
   }
 
+  inline bool is_valid() {
+    return _mosquitto_obj;
+  }
+
+  inline bool is_connected() {
+    return _connected;
+  }
+
+  inline std::error_condition init() {
+
+    _mosquitto_obj = mosquitto_new(_client_id.c_str(), true, this);
+    if (!_mosquitto_obj) {
+      return get_last_error();
+    }
+
+    mosquitto_connect_callback_set(_mosquitto_obj, on_mosq_connect);
+    mosquitto_disconnect_callback_set(_mosquitto_obj, on_mosq_disconnect);
+    mosquitto_message_callback_set(_mosquitto_obj, on_mosq_message);
+    mosquitto_subscribe_callback_set(_mosquitto_obj, on_mosq_subscribe);
+    mosquitto_log_callback_set(_mosquitto_obj, on_mosq_log_message);
+
+    return {};
+
+  }
+
+  inline void set_on_message_cb(gnat_callback_on_message_t cb) {
+    _on_message_callback = std::move(cb);
+  }
+
   inline bool set_credentials(const std::string& username, const std::string& password) {
     if (!is_valid()) {
       return false;
     }
-
     return mosquitto_username_pw_set(_mosquitto_obj, username.c_str(), password.c_str()) == MOSQ_ERR_SUCCESS;
   }
 
-  inline std::error_condition connect(const std::string& client_name, const std::string& host, uint16_t port) {
-    _mosquitto_obj = mosquitto_new(_client_id.c_str(), true, this);
-    mosquitto_connect_callback_set(_mosquitto_obj, on_mosq_connect);
-    mosquitto_disconnect_callback_set(_mosquitto_obj, on_mosq_disconnect);
-    mosquitto_message_callback_set(_mosquitto_obj, on_mosq_message);
-    return convert_mosquitto_error(mosquitto_connect(_mosquitto_obj,
+  inline void disconnect() {
+    mosquitto_disconnect(_mosquitto_obj);
+    mosquitto_destroy(_mosquitto_obj);
+    _connected = false;
+  }
+
+  inline std::error_condition connect(const std::string& client_name, const std::string& host, uint16_t port, std::chrono::milliseconds timeout) {
+
+    if (!_mosquitto_obj) {
+      return std::errc::operation_not_supported;
+    }
+
+    int res = mosquitto_connect(_mosquitto_obj,
                                                      host.c_str(),
                                                      port,
-                                                     DEFAULT_MQTT_KEEPALIVE.count()));
+                                                     DEFAULT_MQTT_KEEPALIVE.count());
+    if (res) {
+      return convert_mosquitto_error(res);
+    }
+    //we need to wait for CONNACK
+    auto time_start = std::chrono::steady_clock::now();
+    while (true) {
+      process(10ms);
+      if (is_connected()) {
+        return {};
+      }
+      auto time_now = std::chrono::steady_clock::now();
+      std::chrono::milliseconds ms_taken = std::chrono::duration_cast<std::chrono::milliseconds>((time_now - time_start));
+      if (ms_taken > timeout) {
+        disconnect();
+        return std::errc::timed_out;
+      }
+    }
   }
 
   inline std::error_condition subscribe(const std::string& topic, mosquitto_qos qos) {
-    return convert_mosquitto_error(mosquitto_subscribe(_mosquitto_obj, nullptr, topic.c_str(), static_cast<int>(qos)));
+    int res = mosquitto_subscribe(_mosquitto_obj, nullptr, topic.c_str(), static_cast<int>(qos));
+    return convert_mosquitto_error(res);
   }
+
+  inline std::error_condition process(std::chrono::milliseconds timeout) {
+      return convert_mosquitto_error(mosquitto_loop(_mosquitto_obj, timeout.count(), 1));
+  };
 
 };
 
