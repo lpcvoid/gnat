@@ -1,5 +1,7 @@
 # Generated from CLion C/C++ Code Style settings
 BasedOnStyle: LLVM
+BinPackArguments: false
+BinPackParameters: false
 AccessModifierOffset: -1
 AlignAfterOpenBracket: Align
 AlignConsecutiveAssignments: None
